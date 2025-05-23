@@ -18,6 +18,8 @@ import json
 import urllib.request
 import tarfile
 import shutil
+import re
+import time
 from bpy.props import StringProperty, CollectionProperty, BoolProperty, IntProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup, AddonPreferences
 
@@ -144,7 +146,7 @@ def get_audio_tracks(video_path):
     
     command = [
         ffprobe_exe, "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index:stream_tags=language",
+        "-show_entries", "stream=index,duration,codec_name,channels,sample_rate:stream_tags=language",
         "-of", "json", video_path
     ]
 
@@ -176,6 +178,69 @@ def get_audio_tracks(video_path):
         error_detail = f"Unexpected error running ffprobe: {e}"
         return {"error": "ffprobe_unexpected_error", "detail": error_detail}
 
+def run_ffmpeg_with_progress(command, timeout, duration_seconds=None, operation_name="FFmpeg"):
+    """Run FFmpeg command with progress monitoring and update Blender's progress bar"""
+    wm = bpy.context.window_manager
+    
+    try:
+        # Start the process
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        
+        start_time = time.time()
+        last_progress = 0
+        
+        # Monitor the process
+        while process.poll() is None:
+            # Check for timeout
+            if time.time() - start_time > timeout:
+                process.terminate()
+                process.wait(timeout=5)
+                return None, "Process timed out"
+            
+            # Read stderr for progress (FFmpeg outputs progress to stderr)
+            try:
+                line = process.stderr.readline()
+                if line:
+                    # Parse FFmpeg progress output
+                    # Look for time= patterns
+                    time_match = re.search(r'time=(\d{2}):(\d{2}):(\d{2}\.\d{2})', line)
+                    if time_match and duration_seconds:
+                        hours = int(time_match.group(1))
+                        minutes = int(time_match.group(2))
+                        seconds = float(time_match.group(3))
+                        current_time = hours * 3600 + minutes * 60 + seconds
+                        
+                        progress = min(current_time / duration_seconds, 1.0)
+                        
+                        # Only update if progress increased significantly (avoid spam)
+                        if progress - last_progress > 0.01:
+                            wm.progress_update(progress)
+                            last_progress = progress
+                            
+            except:
+                # Continue even if progress parsing fails
+                pass
+            
+            # Small delay to prevent excessive CPU usage
+            time.sleep(0.1)
+        
+        # Get final output
+        stdout, stderr = process.communicate()
+        
+        if process.returncode == 0:
+            return stdout, None
+        else:
+            return None, stderr
+            
+    except Exception as e:
+        return None, str(e)
+
 # Property group for each audio track (kept for compatibility)
 class AudioTrackItem(PropertyGroup):
     index: StringProperty(name="Index")
@@ -191,368 +256,428 @@ class SEQUENCER_PT_MultiAudioImport(Panel):
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.multi_audio_props
+        
+        # Check if we're in the sequence editor and have strips
+        if not context.scene.sequence_editor or not context.scene.sequence_editor.sequences:
+            layout.label(text="No sequences available", icon='INFO')
+            return
+            
+        # Check for selected video strips
+        seq_editor = context.scene.sequence_editor
+        selected_video_strips = []
+        
+        for strip in seq_editor.sequences_all:
+            if strip.select and strip.type in ['MOVIE', 'SOUND']:
+                if strip.type == 'MOVIE' or (strip.type == 'SOUND' and hasattr(strip, 'sound') and strip.sound.filepath):
+                    selected_video_strips.append(strip)
+        
+        if not selected_video_strips:
+            layout.label(text="Select a video/movie strip", icon='INFO')
+            layout.label(text="to extract additional audio tracks")
+        elif len(selected_video_strips) > 1:
+            layout.label(text="Select only one video strip", icon='ERROR')
+        else:
+            selected_strip = selected_video_strips[0]
+            
+            # Get source file info
+            if selected_strip.type == 'MOVIE':
+                source_file = bpy.path.abspath(selected_strip.filepath)
+                strip_type = "Video"
+            else:  # SOUND
+                source_file = bpy.path.abspath(selected_strip.sound.filepath)
+                strip_type = "Audio"
+            
+            # Display strip info
+            layout.label(text=f"Selected: {selected_strip.name}", icon='SEQUENCE')
+            layout.label(text=f"Type: {strip_type}")
+            
+            if os.path.isfile(source_file):
+                file_size_mb = os.path.getsize(source_file) / (1024 * 1024)
+                layout.label(text=f"Size: {file_size_mb:.1f} MB")
+                layout.separator()
+                layout.operator("multi_audio.extract_additional_tracks", 
+                              icon="SPEAKER", 
+                              text="Extract Additional Audio Tracks")
+            else:
+                layout.label(text="⚠ Source file not found", icon='ERROR')
+                layout.label(text=f"Path: {source_file}")
+                layout.separator()
+                layout.label(text="Tip: Use 'Make Paths Relative'")
+                layout.label(text="or ensure source file exists")
 
-        layout.prop(props, "video_path")
-        layout.operator("multi_audio.scan_and_import_all", icon="FILE_REFRESH", text="Import Video & All Audio (Meta)")
-
-# Main import operator
-class AUDIO_OT_ScanAndImportAll(Operator):
-    bl_idname = "multi_audio.scan_and_import_all"
-    bl_label = "Import Video and All Audio Tracks (Metastrip)"
+# Main extract operator
+class AUDIO_OT_ExtractAdditionalTracks(Operator):
+    bl_idname = "multi_audio.extract_additional_tracks"
+    bl_label = "Extract Additional Audio Tracks"
+    bl_description = "Extract additional audio tracks from the selected video/audio strip and create a metastrip"
 
     def execute(self, context):
-        props = context.scene.multi_audio_props
-        video_path = bpy.path.abspath(props.video_path)
-
-        if not props.video_path:
-            self.report({'ERROR'}, "Please select a video file first.")
+        # Check sequence editor
+        if not context.scene.sequence_editor:
+            self.report({'ERROR'}, "No sequence editor available.")
             return {'CANCELLED'}
-
-        if not os.path.isfile(video_path):
-            self.report({'ERROR'}, f"Video file not found: {video_path}")
-            return {'CANCELLED'}
-
-        # Scan for audio tracks
-        self.report({'INFO'}, "Scanning for audio tracks...")
-        found_audio_info = get_audio_tracks(video_path)
-
-        if isinstance(found_audio_info, dict) and "error" in found_audio_info:
-            self.report({'ERROR'}, f"Failed to scan audio tracks: {found_audio_info['detail']}")
-            return {'CANCELLED'}
-        
-        found_audio_streams = found_audio_info
-        
-        if not found_audio_streams:
-            self.report({'INFO'}, "No audio tracks found. Importing video only.")
-        else:
-            self.report({'INFO'}, f"Found {len(found_audio_streams)} audio track(s). Proceeding with import.")
-
-        # Get video properties (duration, framerate, frame count) directly from ffprobe
-        self.report({'INFO'}, "Analyzing video properties...")
-        try:
-            ffprobe_exe = get_executable_path("ffprobe")
             
-            # Get comprehensive video stream information
-            video_info_command = [
-                ffprobe_exe, "-v", "error", "-select_streams", "v:0",
-                "-show_entries", "stream=duration,r_frame_rate,nb_frames:format=duration",
-                "-of", "json", video_path
-            ]
-            
-            result = subprocess.run(video_info_command, capture_output=True, text=True, check=False, timeout=30)
-            
-            if result.returncode != 0:
-                self.report({'ERROR'}, f"Failed to analyze video properties: {result.stderr.strip()}")
-                return {'CANCELLED'}
-            
-            video_info = json.loads(result.stdout)
-            
-            # Extract video duration
-            video_duration_seconds = None
-            if 'streams' in video_info and video_info['streams']:
-                stream = video_info['streams'][0]
-                if 'duration' in stream:
-                    video_duration_seconds = float(stream['duration'])
-                    self.report({'INFO'}, f"Video stream duration: {video_duration_seconds:.3f} seconds")
-            
-            # Fallback to format duration if stream duration not available
-            if video_duration_seconds is None and 'format' in video_info and 'duration' in video_info['format']:
-                video_duration_seconds = float(video_info['format']['duration'])
-                self.report({'INFO'}, f"Video format duration: {video_duration_seconds:.3f} seconds")
-            
-            # Extract video framerate
-            video_framerate = None
-            if 'streams' in video_info and video_info['streams']:
-                stream = video_info['streams'][0]
-                if 'r_frame_rate' in stream and stream['r_frame_rate'] != '0/0':
-                    # Parse fractional framerate (e.g., "30000/1001" for 29.97fps)
-                    fps_parts = stream['r_frame_rate'].split('/')
-                    if len(fps_parts) == 2:
-                        video_framerate = float(fps_parts[0]) / float(fps_parts[1])
-                        self.report({'INFO'}, f"Video framerate: {video_framerate:.3f} fps")
-            
-            # Extract frame count if available
-            video_frame_count = None
-            if 'streams' in video_info and video_info['streams']:
-                stream = video_info['streams'][0]
-                if 'nb_frames' in stream:
-                    video_frame_count = int(stream['nb_frames'])
-                    self.report({'INFO'}, f"Video frame count: {video_frame_count} frames")
-            
-            # Calculate expected frame count if we have duration and framerate
-            if video_duration_seconds is not None and video_framerate is not None:
-                calculated_frames = int(round(video_duration_seconds * video_framerate))
-                self.report({'INFO'}, f"Calculated frames from duration×fps: {calculated_frames} frames")
-                
-                # Use the more reliable frame count
-                if video_frame_count is None:
-                    video_frame_count = calculated_frames
-                elif abs(video_frame_count - calculated_frames) > 2:  # Allow small rounding differences
-                    self.report({'WARNING'}, f"Frame count mismatch: metadata={video_frame_count}, calculated={calculated_frames}")
-            
-            if video_duration_seconds is None:
-                self.report({'ERROR'}, "Could not determine video duration from ffprobe")
-                return {'CANCELLED'}
-                
-        except Exception as e:
-            self.report({'ERROR'}, f"Failed to analyze video properties: {e}")
-            return {'CANCELLED'}
-
-        # Get project framerate for comparison
-        scene = context.scene
-        project_fps = scene.render.fps / scene.render.fps_base
-        self.report({'INFO'}, f"Project framerate: {project_fps:.3f} fps")
-        
-        # Calculate expected frame duration in project time
-        if video_framerate is not None and abs(video_framerate - project_fps) > 0.01:
-            self.report({'WARNING'}, f"Framerate mismatch detected! Video: {video_framerate:.3f} fps, Project: {project_fps:.3f} fps")
-            
-            # Calculate the correct frame duration for the project framerate
-            # This ensures the video plays at the correct speed in the project
-            correct_frame_duration = int(round(video_duration_seconds * project_fps))
-            self.report({'INFO'}, f"Adjusting video duration to {correct_frame_duration} frames for project framerate")
-        else:
-            # Framerates match or video framerate unknown, use duration-based calculation
-            correct_frame_duration = int(round(video_duration_seconds * project_fps))
-            self.report({'INFO'}, f"Using duration-based frame count: {correct_frame_duration} frames")
-
-        # Set up sequence editor
         seq_editor = context.scene.sequence_editor
-        if not seq_editor:
-            context.scene.sequence_editor_create()
-            seq_editor = context.scene.sequence_editor
-
-        frame_start_val = 1
         
-        # Find next available channel
-        max_occupied_channel = 0
-        if seq_editor.sequences_all:
-            for s in seq_editor.sequences_all:
-                num_chans_in_strip = getattr(s, 'channels', 1) if s.type == 'META' else 1
-                strip_end_channel = s.channel + num_chans_in_strip - 1
-                if strip_end_channel > max_occupied_channel:
-                    max_occupied_channel = strip_end_channel
-        current_channel_base = max_occupied_channel + 1
-
-        video_strip_name_base = os.path.basename(video_path).rsplit('.', 1)[0]
+        # Find selected video/audio strip
+        selected_strip = None
+        for strip in seq_editor.sequences_all:
+            if strip.select and strip.type in ['MOVIE', 'SOUND']:
+                if strip.type == 'MOVIE' or (strip.type == 'SOUND' and hasattr(strip, 'sound') and strip.sound.filepath):
+                    if selected_strip is None:
+                        selected_strip = strip
+                    else:
+                        self.report({'ERROR'}, "Multiple strips selected. Please select only one video/audio strip.")
+                        return {'CANCELLED'}
         
-        strips_for_meta = []
-        meta_part_channel = 1
+        if not selected_strip:
+            self.report({'ERROR'}, "No video or audio strip selected.")
+            return {'CANCELLED'}
+        
+        # Get source file path
+        if selected_strip.type == 'MOVIE':
+            source_file = bpy.path.abspath(selected_strip.filepath)
+        else:  # SOUND
+            source_file = bpy.path.abspath(selected_strip.sound.filepath)
+        
+        if not os.path.isfile(source_file):
+            self.report({'ERROR'}, f"Source file not found: {source_file}")
+            return {'CANCELLED'}
 
-        # Import video
-        self.report({'INFO'}, "Importing video...")
+        # Initialize progress bar
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        
         try:
-            # CRITICAL: Extract video-only first to prevent Blender from extending duration based on audio tracks
-            video_only_filename = f"video_only_{video_strip_name_base}.mp4"
-            video_only_path = os.path.join(tempfile.gettempdir(), video_only_filename)
-            
-            ffmpeg_exe = get_executable_path("ffmpeg")
-            
-            # Determine if we need framerate conversion
-            needs_framerate_conversion = (video_framerate is not None and 
-                                        abs(video_framerate - project_fps) > 0.01)
-            
-            if needs_framerate_conversion:
-                self.report({'INFO'}, f"Converting video framerate from {video_framerate:.3f}fps to {project_fps:.3f}fps...")
-                
-                # Convert framerate to match project settings
-                video_extract_command = [
-                    ffmpeg_exe, "-y", "-i", video_path,
-                    "-map", "0:v:0",  # Map only the first video stream
-                    "-an",  # Explicitly no audio
-                    "-vf", f"fps={project_fps:.6f}",  # Convert framerate using video filter
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "18",  # High-quality encode
-                    "-avoid_negative_ts", "make_zero",  # Ensure clean timing
-                    "-t", str(video_duration_seconds),  # Ensure exact duration
-                    video_only_path
-                ]
-                
-                self.report({'INFO'}, "Re-encoding video with framerate conversion...")
-                result = subprocess.run(video_extract_command, capture_output=True, text=True, check=False, timeout=180)
-                
-            else:
-                # No framerate conversion needed, try to copy first
-                self.report({'INFO'}, "Extracting video without framerate conversion...")
-                video_extract_command = [
-                    ffmpeg_exe, "-y", "-i", video_path,
-                    "-map", "0:v:0",  # Map only the first video stream
-                    "-an",  # Explicitly no audio
-                    "-c:v", "copy",  # Copy video without re-encoding to preserve exact timing
-                    "-avoid_negative_ts", "make_zero",  # Ensure clean timing
-                    "-t", str(video_duration_seconds),  # Ensure exact duration
-                    video_only_path
-                ]
-                
-                result = subprocess.run(video_extract_command, capture_output=True, text=True, check=False, timeout=60)
-                
-                if result.returncode != 0:
-                    # Fallback: re-encode if copy fails, but preserve timing
-                    self.report({'INFO'}, "Video copy failed, trying re-encode...")
-                    video_extract_command = [
-                        ffmpeg_exe, "-y", "-i", video_path,
-                        "-map", "0:v:0",  # Map only the first video stream
-                        "-an",  # Explicitly no audio
-                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",  # Fast, high-quality re-encode
-                        "-avoid_negative_ts", "make_zero",
-                        "-t", str(video_duration_seconds),  # Ensure exact duration
-                        video_only_path
-                    ]
-                    result = subprocess.run(video_extract_command, capture_output=True, text=True, check=False, timeout=120)
-            
-            if result.returncode != 0:
-                self.report({'ERROR'}, f"Failed to extract video-only: {result.stderr.strip()}")
+            # Phase 1: Scan for audio tracks (10% of progress)
+            wm.progress_update(10)
+            self.report({'INFO'}, f"Scanning audio tracks in: {os.path.basename(source_file)}")
+            found_audio_info = get_audio_tracks(source_file)
+
+            if isinstance(found_audio_info, dict) and "error" in found_audio_info:
+                self.report({'ERROR'}, f"Failed to scan audio tracks: {found_audio_info['detail']}")
                 return {'CANCELLED'}
             
-            # Now import the video-only file
-            video_strip = seq_editor.sequences.new_movie(
-                name=video_strip_name_base,
-                filepath=video_only_path,
-                channel=meta_part_channel,
-                frame_start=frame_start_val
-            )
+            found_audio_streams = found_audio_info
             
-            # Verify the imported duration
-            imported_duration = video_strip.frame_final_duration
-            self.report({'INFO'}, f"Blender imported video with {imported_duration} frames, expected {correct_frame_duration} frames")
-            
-            # With proper framerate conversion, the duration should now be correct
-            if abs(imported_duration - correct_frame_duration) > 2:  # Allow 2-frame tolerance for encoding
-                self.report({'WARNING'}, f"Duration mismatch persists after framerate conversion: imported={imported_duration}, expected={correct_frame_duration}")
-                
-                # Only try manual adjustment if the difference is significant
-                if abs(imported_duration - correct_frame_duration) > 5:
-                    self.report({'INFO'}, f"Attempting manual duration adjustment...")
-                    try:
-                        video_strip.frame_final_end = video_strip.frame_final_start + correct_frame_duration - 1
-                        self.report({'INFO'}, f"Adjusted video strip duration to {video_strip.frame_final_duration} frames")
-                    except Exception as e:
-                        self.report({'WARNING'}, f"Could not adjust video strip duration: {e}")
+            if not found_audio_streams:
+                self.report({'INFO'}, "No audio tracks found in source file.")
+                return {'FINISHED'}
+            elif len(found_audio_streams) <= 1:
+                self.report({'INFO'}, f"Only {len(found_audio_streams)} audio track found. No additional tracks to extract.")
+                return {'FINISHED'}
             else:
-                self.report({'INFO'}, f"✓ Video duration is correct: {imported_duration} frames")
+                self.report({'INFO'}, f"Found {len(found_audio_streams)} audio tracks. Extracting additional tracks...")
+                
+                # Log detailed information about each track found
+                for i, stream_info in enumerate(found_audio_streams):
+                    stream_index = str(stream_info.get("index"))
+                    stream_duration = stream_info.get("duration", "unknown")
+                    stream_codec = stream_info.get("codec_name", "unknown")
+                    stream_channels = stream_info.get("channels", "unknown")
+                    stream_sample_rate = stream_info.get("sample_rate", "unknown")
+                    stream_lang_tags = stream_info.get("tags", {})
+                    stream_lang = stream_lang_tags.get("language", f"Track_{stream_index}")
+                    
+                    self.report({'INFO'}, f"Track {i}: index={stream_index}, lang={stream_lang}, duration={stream_duration}s, codec={stream_codec}, channels={stream_channels}, sample_rate={stream_sample_rate}")
+                    
+                    # Warn about potential empty/silent tracks
+                    if stream_duration and stream_duration != "unknown":
+                        try:
+                            duration_float = float(stream_duration)
+                            if duration_float < 1.0:
+                                self.report({'WARNING'}, f"Track {stream_index} ({stream_lang}) appears very short ({duration_float:.3f}s) - may be empty/silent")
+                        except:
+                            pass
+
+            # Phase 2: Analyze video properties for duration (20% of progress)
+            wm.progress_update(20)
+            self.report({'INFO'}, "Getting source file duration...")
+            try:
+                ffprobe_exe = get_executable_path("ffprobe")
+                
+                file_size_mb = os.path.getsize(source_file) / (1024 * 1024)
+                
+                # Get video duration
+                video_info_command = [
+                    ffprobe_exe, "-v", "error", 
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", source_file
+                ]
+                
+                result = subprocess.run(video_info_command, capture_output=True, text=True, check=False, timeout=30)
+                
+                if result.returncode != 0 or not result.stdout.strip():
+                    self.report({'ERROR'}, f"Failed to get duration from source file")
+                    return {'CANCELLED'}
+                
+                video_duration_seconds = float(result.stdout.strip())
+                self.report({'INFO'}, f"Source duration: {video_duration_seconds:.3f} seconds")
+                
+                # Get actual video FPS (crucial for accurate duration calculations)
+                video_fps_command = [
+                    ffprobe_exe, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=r_frame_rate",
+                    "-of", "default=noprint_wrappers=1:nokey=1", source_file
+                ]
+                
+                fps_result = subprocess.run(video_fps_command, capture_output=True, text=True, check=False, timeout=30)
+                
+                if fps_result.returncode == 0 and fps_result.stdout.strip():
+                    # Parse frame rate (could be in format like "30/1" or "29.97")
+                    fps_string = fps_result.stdout.strip()
+                    if '/' in fps_string:
+                        # Handle fractional format like "30/1" or "30000/1001" 
+                        numerator, denominator = fps_string.split('/')
+                        actual_video_fps = float(numerator) / float(denominator)
+                    else:
+                        actual_video_fps = float(fps_string)
+                    
+                    self.report({'INFO'}, f"Source video FPS: {actual_video_fps:.3f}")
+                else:
+                    # Fallback to project FPS if video FPS detection fails
+                    scene = context.scene
+                    actual_video_fps = scene.render.fps / scene.render.fps_base
+                    self.report({'WARNING'}, f"Could not detect video FPS, using project FPS: {actual_video_fps:.3f}")
+                
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to analyze source file: {e}")
+                return {'CANCELLED'}
+
+            # Phase 3: Prepare for safe audio extraction (30% of progress)
+            wm.progress_update(30)
             
-            strips_for_meta.append(video_strip)
-            meta_part_channel += 1
+            # Store ALL original strip properties to preserve user's work
+            original_strip_name = selected_strip.name
+            original_strip_channel = selected_strip.channel
+            original_frame_start = selected_strip.frame_start
+            original_frame_final_start = selected_strip.frame_final_start  
+            original_frame_final_end = selected_strip.frame_final_end
+            original_frame_final_duration = selected_strip.frame_final_duration
+            original_frame_offset_start = getattr(selected_strip, 'frame_offset_start', 0)
+            original_frame_offset_end = getattr(selected_strip, 'frame_offset_end', 0)
+            
+            self.report({'INFO'}, f"Original strip properties: start={original_frame_start}, final_start={original_frame_final_start}, final_end={original_frame_final_end}, duration={original_frame_final_duration}")
+            
+            # If we have multiple audio tracks, extract them safely
+            if len(found_audio_streams) > 1:
+                self.report({'INFO'}, f"Extracting all {len(found_audio_streams)} audio tracks safely...")
+                
+                additional_tracks = found_audio_streams[1:]  # Skip first track (will be included with original strip)
+                
+                audio_timeout = max(60, min(600, int(file_size_mb * 2)))
+                
+                # Find temporary extraction area - use a simple, predictable location
+                # Instead of calculating complex safe areas, use frame 1000+ for temporary extraction
+                temp_extraction_start = 1000
+                
+                self.report({'INFO'}, f"Using temporary extraction area starting at frame {temp_extraction_start}")
+                
+                # Find available channels for extraction  
+                occupied_channels = [s.channel for s in seq_editor.sequences_all]
+                if occupied_channels:
+                    max_channel = max(occupied_channels)
+                    extraction_start_channel = max_channel + 1
+                    self.report({'INFO'}, f"Found channels 1-{max_channel} occupied, using channel {extraction_start_channel}+ for extraction")
+                else:
+                    extraction_start_channel = 1
+                    self.report({'INFO'}, f"No existing channels found, starting extraction at channel {extraction_start_channel}")
+                
+                created_audio_strips = []  # Track all strips we create
+                next_channel = extraction_start_channel
+
+                # Phase 4: Extract and add additional audio tracks to main timeline (30-80% of progress)
+                # Extract the exact duration requested by the user's video strip, since all audio
+                # tracks were recorded simultaneously and should have identical durations.
+                for i, stream_info in enumerate(additional_tracks):
+                    # Update progress for each audio track
+                    audio_progress = 30 + (50 * (i + 1) / len(additional_tracks))
+                    wm.progress_update(audio_progress)
+                    
+                    stream_index = str(stream_info.get("index")) 
+                    stream_lang_tags = stream_info.get("tags", {})
+                    stream_lang = stream_lang_tags.get("language", f"Track_{stream_index}")
+
+                    temp_audio_filename = f"additional_audio_{original_strip_name}_track_{stream_index}.aac"
+                    # Save extracted audio next to original video file instead of temp directory
+                    source_dir = os.path.dirname(source_file)
+                    temp_path = os.path.join(source_dir, temp_audio_filename)
+                    
+                    self.report({'INFO'}, f"Extracting additional audio track {stream_index} ({stream_lang}) [{i+1}/{len(additional_tracks)}]...")
+                    
+                    try:
+                        ffmpeg_exe = get_executable_path("ffmpeg")
+                        
+                        # Calculate precise duration from original strip's frame count
+                        # Use actual video FPS instead of project FPS for accuracy
+                        precise_duration_seconds = original_frame_final_duration / actual_video_fps
+                        
+                        # Calculate the exact start time in the source file
+                        # This accounts for any trimming/offset the user has applied
+                        strip_start_offset_seconds = original_frame_offset_start / actual_video_fps
+                        
+                        self.report({'INFO'}, f"Strip offsets: frame_offset_start={original_frame_offset_start}, frame_offset_end={original_frame_offset_end}")
+                        self.report({'INFO'}, f"Using precise extraction: start={strip_start_offset_seconds:.3f}s, duration={precise_duration_seconds:.3f}s ({original_frame_final_duration} frames at {actual_video_fps:.2f} FPS)")
+                        
+                        # Extract entire audio track without duration limit to test natural length
+                        ffmpeg_command = [
+                            ffmpeg_exe, "-y", 
+                            "-ss", f"{strip_start_offset_seconds:.6f}",  # Seek BEFORE input for accuracy
+                            "-i", source_file,
+                            "-map", f"0:{stream_index}", 
+                            "-vn",  # No video output
+                            "-acodec", "copy",  # Copy audio without re-encoding to preserve timing
+                            temp_path  # Extract entire track to see natural length
+                        ]
+                        
+                        # Debug: Show the exact FFmpeg command
+                        cmd_str = ' '.join(ffmpeg_command)
+                        self.report({'INFO'}, f"FFmpeg command: {cmd_str}")
+                        
+                        stdout, stderr = run_ffmpeg_with_progress(
+                            ffmpeg_command, 
+                            audio_timeout, 
+                            precise_duration_seconds, 
+                            f"Additional Audio Track {i+1}"
+                        )
+                        
+                        if stderr:
+                            self.report({'WARNING'}, f"Failed to extract audio track {stream_index}: {stderr}")
+                            continue
+
+                        # Check the extracted file properties for debugging
+                        if os.path.exists(temp_path):
+                            file_size_kb = os.path.getsize(temp_path) / 1024
+                            self.report({'INFO'}, f"Extracted audio file: {file_size_kb:.1f} KB")
+                            
+                            # Verify extracted file duration with ffprobe for debugging
+                            try:
+                                verify_command = [
+                                    ffprobe_exe, "-v", "error", 
+                                    "-show_entries", "format=duration",
+                                    "-of", "default=noprint_wrappers=1:nokey=1", temp_path
+                                ]
+                                verify_result = subprocess.run(verify_command, capture_output=True, text=True, check=False, timeout=10)
+                                
+                                if verify_result.returncode == 0 and verify_result.stdout.strip():
+                                    actual_extracted_duration = float(verify_result.stdout.strip())
+                                    self.report({'INFO'}, f"Verified extracted file duration: {actual_extracted_duration:.3f}s (requested: {precise_duration_seconds:.3f}s)")
+                                else:
+                                    self.report({'WARNING'}, f"Could not verify extracted file duration")
+                            except Exception as e:
+                                self.report({'WARNING'}, f"Error verifying extracted file: {e}")
+                            
+                            # Special warning for very small files (likely silent/empty tracks)
+                            if file_size_kb < 10:  # Less than 10KB is suspiciously small for real audio
+                                self.report({'WARNING'}, f"Track {stream_index} ({stream_lang}) extracted file is very small ({file_size_kb:.1f} KB)")
+                                self.report({'WARNING'}, f"This track may be silent/empty but will still be included in the metastrip")
+                        else:
+                            self.report({'WARNING'}, f"Extracted audio file not found: {temp_path}")
+                            continue
+
+                        # Import the extracted audio to safe area on timeline
+                        audio_strip_name = f"Audio_{stream_lang}"
+                        
+                        # Create the sound strip in safe extraction area  
+                        audio_strip = seq_editor.sequences.new_sound(
+                            name=audio_strip_name,
+                            filepath=temp_path,
+                            channel=next_channel,
+                            frame_start=temp_extraction_start  # Place in temporary area
+                        )
+                        
+                        # Verify the strip was created
+                        if audio_strip:
+                            self.report({'INFO'}, f"Created {audio_strip_name}: start={audio_strip.frame_start}, final_start={audio_strip.frame_final_start}, final_end={audio_strip.frame_final_end}, duration={audio_strip.frame_final_duration}")
+                                
+                            created_audio_strips.append(audio_strip)
+                            self.report({'INFO'}, f"✓ Added {audio_strip_name} on channel {audio_strip.channel} (natural duration: {audio_strip.frame_final_duration} frames)")
+                            next_channel += 1
+                        else:
+                            self.report({'WARNING'}, f"Failed to create audio strip {audio_strip_name}")
+                    
+                    except Exception as e:
+                        self.report({'WARNING'}, f"Failed to import audio track {stream_index}: {e}")
+                        continue
+                
+                # Phase 5: Create metastrip from all tracks (80-100% of progress)
+                wm.progress_update(90)
+                
+                if created_audio_strips:
+                    self.report({'INFO'}, f"Creating metastrip from original strip + {len(created_audio_strips)} additional audio tracks...")
+                    
+                    # First, move original strip to temporary area to group with audio tracks
+                    original_strip_temp_start = temp_extraction_start
+                    selected_strip.frame_start = original_strip_temp_start
+                    selected_strip.channel = extraction_start_channel - 1  # Place original strip just below audio tracks
+                    
+                    self.report({'INFO'}, f"Temporarily moved original strip to temporary area for grouping...")
+                    
+                    # Select all strips to include in metastrip (original + all new audio tracks)
+                    bpy.ops.sequencer.select_all(action='DESELECT')
+                    selected_strip.select = True
+                    for audio_strip in created_audio_strips:
+                        audio_strip.select = True
+                    
+                    # Create metastrip from all selected strips
+                    bpy.ops.sequencer.meta_make()
+                    
+                    if seq_editor.active_strip and seq_editor.active_strip.type == 'META':
+                        meta_strip = seq_editor.active_strip
+                        meta_strip.name = f"MultiAudio_{original_strip_name}"
+                        
+                        # Phase 6: Restore original position and properties
+                        self.report({'INFO'}, f"Restoring original strip position and properties...")
+                        
+                        # Move metastrip back to original position
+                        meta_strip.frame_start = original_frame_start
+                        meta_strip.channel = original_strip_channel
+                        
+                        # Restore original trimming and offset properties
+                        if hasattr(meta_strip, 'frame_offset_start'):
+                            meta_strip.frame_offset_start = original_frame_offset_start
+                        if hasattr(meta_strip, 'frame_offset_end'):
+                            meta_strip.frame_offset_end = original_frame_offset_end
+                        
+                        # Ensure final duration matches original (handles trimming)
+                        if hasattr(meta_strip, 'frame_final_duration'):
+                            try:
+                                # Calculate the duration adjustment needed
+                                current_duration = meta_strip.frame_final_duration
+                                target_duration = original_frame_final_duration
+                                if abs(current_duration - target_duration) > 1:  # Allow 1 frame tolerance
+                                    # Adjust end trimming to match original duration
+                                    duration_diff = current_duration - target_duration
+                                    meta_strip.frame_offset_end = original_frame_offset_end + duration_diff
+                                    self.report({'INFO'}, f"Adjusted duration from {current_duration} to {target_duration} frames")
+                            except Exception as duration_error:
+                                self.report({'WARNING'}, f"Could not fully restore duration: {duration_error}")
+                        
+                        self.report({'INFO'}, f"✓ Successfully created metastrip '{meta_strip.name}' containing:")
+                        self.report({'INFO'}, f"  - 1 video track")  
+                        self.report({'INFO'}, f"  - {len(created_audio_strips) + 1} audio tracks")
+                        self.report({'INFO'}, f"✓ All {len(found_audio_streams)} audio tracks successfully grouped!")
+                        self.report({'INFO'}, f"✓ Original position and properties preserved!")
+                        self.report({'INFO'}, f"✓ Timeline safety maintained - no existing content disturbed!")
+                        self.report({'INFO'}, f"✓ Using efficient PCM compression (much smaller files)!")
+                    else:
+                        self.report({'WARNING'}, "Metastrip creation may have failed, but audio tracks were added successfully")
+                else:
+                    self.report({'WARNING'}, "No additional audio tracks were successfully extracted")
+                
+            else:
+                # Only one audio track, no need for metastrip
+                self.report({'INFO'}, "Only one audio track found. No additional processing needed.")
+            
+            wm.progress_update(100)
+            return {'FINISHED'}
             
         except Exception as e:
-            self.report({'ERROR'}, f"Failed to import video: {e}")
+            self.report({'ERROR'}, f"Failed to extract additional audio tracks: {e}")
             return {'CANCELLED'}
-
-        # Import audio tracks using exact duration from video analysis
-        successfully_imported_audio_count = 0
-        if found_audio_streams and video_strip:
-            try:
-                ffmpeg_exe = get_executable_path("ffmpeg")
-            except FileNotFoundError as e:
-                self.report({'ERROR'}, str(e))
-                return {'CANCELLED'}
-                
-            for stream_info in found_audio_streams:
-                stream_index = str(stream_info.get("index")) 
-                stream_lang_tags = stream_info.get("tags", {})
-                stream_lang = stream_lang_tags.get("language", f"Track_{stream_index}")
-
-                temp_audio_filename = f"audio_{video_strip_name_base}_track_{stream_index}.wav"
-                temp_path = os.path.join(tempfile.gettempdir(), temp_audio_filename)
-                
-                self.report({'INFO'}, f"Extracting audio track {stream_index} ({stream_lang}) with exact duration {video_duration_seconds:.3f}s...")
-                try:
-                    # Extract audio with exact duration matching video analysis
-                    ffmpeg_command = [
-                        ffmpeg_exe, "-y", "-i", video_path,
-                        "-map", f"0:{stream_index}", 
-                        "-vn",  # No video output
-                        "-acodec", "pcm_s16le",  # Standard WAV codec
-                        "-ar", "48000",  # Standard sample rate
-                        "-ac", "2",  # Stereo output
-                        "-t", str(video_duration_seconds),  # Exact duration from video analysis
-                        "-avoid_negative_ts", "make_zero",  # Ensure timing starts at zero
-                        temp_path
-                    ]
-                    
-                    result = subprocess.run(ffmpeg_command, capture_output=True, text=True, check=False, timeout=60)
-                    
-                    if result.returncode != 0:
-                        self.report({'WARNING'}, f"Failed to extract audio track {stream_index}: {result.stderr.strip()}")
-                        continue
-
-                    audio_strip_name = f"Audio_{stream_lang}_{video_strip_name_base}"
-                    audio_strip = seq_editor.sequences.new_sound(
-                        name=audio_strip_name,
-                        filepath=temp_path,
-                        channel=meta_part_channel,
-                        frame_start=frame_start_val
-                    )
-                    
-                    strips_for_meta.append(audio_strip)
-                    meta_part_channel += 1
-                    successfully_imported_audio_count += 1
-                
-                except Exception as e:
-                    self.report({'WARNING'}, f"Failed to import audio track {stream_index}: {e}")
-                    continue
-        
-        # Create metastrip if we have video + audio, otherwise just position video
-        if video_strip and successfully_imported_audio_count > 0:
-            self.report({'INFO'}, "Creating metastrip...")
-            bpy.ops.sequencer.select_all(action='DESELECT')
-            for s_meta in strips_for_meta:
-                s_meta.select = True
-            
-            seq_editor.active_strip = video_strip
-            
-            # Adjust channel positions before creating meta
-            min_channel_in_meta_parts = min(s.channel for s in strips_for_meta)
-            channel_offset = current_channel_base - min_channel_in_meta_parts
-            if channel_offset != 0:
-                for s_meta in strips_for_meta:
-                    s_meta.channel += channel_offset
-            
-            bpy.ops.sequencer.meta_make()
-            
-            if seq_editor.active_strip and seq_editor.active_strip.type == 'META':
-                seq_editor.active_strip.name = f"Meta_{video_strip_name_base}"
-                if seq_editor.active_strip.channel != current_channel_base:
-                     seq_editor.active_strip.channel = current_channel_base
-                
-                # Final verification of durations
-                final_video_duration = None
-                final_audio_durations = []
-                
-                # Check the metastrip contents for duration verification
-                bpy.ops.sequencer.meta_toggle()  # Enter meta
-                for strip in seq_editor.sequences:
-                    if strip.type == 'MOVIE':
-                        final_video_duration = strip.frame_final_duration
-                    elif strip.type == 'SOUND':
-                        final_audio_durations.append(strip.frame_final_duration)
-                bpy.ops.sequencer.meta_toggle()  # Exit meta
-                
-                if final_video_duration and final_audio_durations:
-                    max_audio_duration = max(final_audio_durations)
-                    duration_diff = abs(final_video_duration - max_audio_duration)
-                    if duration_diff <= 1:  # 1-frame tolerance
-                        self.report({'INFO'}, f"✓ Duration verification passed: Video={final_video_duration}, Audio={max_audio_duration} frames")
-                    else:
-                        self.report({'WARNING'}, f"⚠ Duration mismatch detected: Video={final_video_duration}, Audio={max_audio_duration} frames (diff: {duration_diff})")
-                
-                self.report({'INFO'}, f"Created metastrip '{seq_editor.active_strip.name}' with video and {successfully_imported_audio_count} audio track(s).")
-            else:
-                self.report({'WARNING'}, "Metastrip creation may have failed.")
-        elif video_strip:
-            # Only video imported
-            video_strip.channel = current_channel_base
-            msg = "Imported video only."
-            if found_audio_streams and successfully_imported_audio_count == 0:
-                msg += " All audio extractions failed."
-            elif not found_audio_streams:
-                 msg += " No audio tracks found."
-            self.report({'INFO'}, msg)
-        else: 
-            self.report({'ERROR'}, "Video import failed.")
-            return {'CANCELLED'}
-            
-        return {'FINISHED'}
+        finally:
+            # Always end progress bar
+            wm.progress_end()
 
 # Property container
 class MultiAudioProperties(PropertyGroup):
@@ -570,7 +695,7 @@ classes = (
     AUDIO_OT_DownloadFFmpeg,
     AudioTrackItem,
     SEQUENCER_PT_MultiAudioImport,
-    AUDIO_OT_ScanAndImportAll,
+    AUDIO_OT_ExtractAdditionalTracks,
     MultiAudioProperties,
 )
 
