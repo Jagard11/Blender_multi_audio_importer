@@ -497,13 +497,15 @@ class AUDIO_OT_ExtractAdditionalTracks(Operator):
                     stream_index = str(stream_info.get("index")) 
                     stream_lang_tags = stream_info.get("tags", {})
                     stream_lang = stream_lang_tags.get("language", f"Track_{stream_index}")
+                    stream_codec = stream_info.get("codec_name", "unknown")
 
-                    temp_audio_filename = f"additional_audio_{original_strip_name}_track_{stream_index}.aac"
+                    # Use WAV format for universal compatibility instead of AAC
+                    temp_audio_filename = f"additional_audio_{original_strip_name}_track_{stream_index}.wav"
                     # Save extracted audio next to original video file instead of temp directory
                     source_dir = os.path.dirname(source_file)
                     temp_path = os.path.join(source_dir, temp_audio_filename)
                     
-                    self.report({'INFO'}, f"Extracting additional audio track {stream_index} ({stream_lang}) [{i+1}/{len(additional_tracks)}]...")
+                    self.report({'INFO'}, f"Extracting additional audio track {stream_index} ({stream_lang}, {stream_codec}) [{i+1}/{len(additional_tracks)}]...")
                     
                     try:
                         ffmpeg_exe = get_executable_path("ffmpeg")
@@ -519,15 +521,16 @@ class AUDIO_OT_ExtractAdditionalTracks(Operator):
                         self.report({'INFO'}, f"Strip offsets: frame_offset_start={original_frame_offset_start}, frame_offset_end={original_frame_offset_end}")
                         self.report({'INFO'}, f"Using precise extraction: start={strip_start_offset_seconds:.3f}s, duration={precise_duration_seconds:.3f}s ({original_frame_final_duration} frames at {actual_video_fps:.2f} FPS)")
                         
-                        # Extract entire audio track without duration limit to test natural length
+                        # Extract audio track and convert to WAV PCM for universal compatibility
                         ffmpeg_command = [
                             ffmpeg_exe, "-y", 
                             "-ss", f"{strip_start_offset_seconds:.6f}",  # Seek BEFORE input for accuracy
                             "-i", source_file,
                             "-map", f"0:{stream_index}", 
                             "-vn",  # No video output
-                            "-acodec", "copy",  # Copy audio without re-encoding to preserve timing
-                            temp_path  # Extract entire track to see natural length
+                            "-acodec", "pcm_s16le",  # Convert to 16-bit PCM for WAV compatibility
+                            "-ar", "48000",  # Standard sample rate
+                            temp_path
                         ]
                         
                         # Debug: Show the exact FFmpeg command
