@@ -1,0 +1,27 @@
+# FFmpeg static binaries (auto-downloaded by addon)
+ffmpeg
+ffprobe
+ffprobe-static
+
+# Temporary files
+*.tmp
+*.temp
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+
+# Archive files
+*.tar.xz
+*.zip
+*.gz 
