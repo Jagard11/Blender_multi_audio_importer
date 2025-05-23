@@ -7,6 +7,14 @@
 
 A powerful Blender addon that automatically imports video files with **all their audio tracks** into organized metastrips in the Video Sequence Editor (VSE). Perfect for working with multi-language videos, multiple audio commentary tracks, or any video with multiple audio streams.
 
+## 📸 See It In Action
+
+![Multi-Audio Importer in Blender](screenshots/blender-multi-audio-demo.png)
+*The addon in action: Video and audio tracks organized in a clean metastrip with the simple import interface*
+
+![Inside the Metastrip](screenshots/blender-metastrip-inside.png)
+*Inside the metastrip: Each audio track is perfectly organized on its own channel for easy editing and mixing*
+
 ## ⚠️ Platform Compatibility Warning
 
 **This addon has currently only been tested on Linux systems.** While it may work on Windows and macOS, we cannot guarantee compatibility or provide support for these platforms at this time. Use on non-Linux systems at your own risk.

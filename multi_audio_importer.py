@@ -7,7 +7,7 @@ bl_info = {
     "description": "Import video with all its audio tracks into a metastrip using FFmpeg. Auto-downloads static binaries.",
     "category": "Sequencer",
     "warning": "Steam installs of Blender may not work with this addon due to the way steam segregates blender from the rest of the system. Manually installing static versions of ffmpeg and ffprobe into the addon directory is recommended.",
-    "doc_url": "https://www.youtube.com/@macarthurz",
+    "doc_url": "",
 }
 
 import bpy
