@@ -59,7 +59,13 @@ If you prefer to use your own FFmpeg installation or the auto-download fails:
 ### Step 1: Prepare Your Video
 1. Open the **Video Editing** workspace in Blender
 2. Import your multi-track video file into the VSE timeline
-3. **Select** the video strip you want to process
+3. **Disconnect the audio track from the video track** (Right-click the video strip → "Separate Images and Sound" or press `Y`)
+4. **Select only the video strip** you want to process
+
+> **⚠️ Important Notes:**
+> - The addon **requires the audio to be disconnected from the video track** before processing
+> - The addon **will not work when multiple strips are selected** - select only one video strip at a time
+> - Use "Separate Images and Sound" (Y hotkey) to disconnect audio from video before processing
 
 ![Prepare to Extract](screenshots/PrepareToExtract.png)
 
