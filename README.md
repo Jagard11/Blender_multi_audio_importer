@@ -1,0 +1,149 @@
+# Multi-Audio Track Video Importer for Blender
+
+![Blender](https://img.shields.io/badge/Blender-3.0%2B-orange)
+![Platform](https://img.shields.io/badge/Platform-Linux-blue)
+![Version](https://img.shields.io/badge/Version-2.0-green)
+![License](https://img.shields.io/badge/License-GPL--3.0-red)
+
+A powerful Blender addon that automatically imports video files with **all their audio tracks** into organized metastrips in the Video Sequence Editor (VSE). Perfect for working with multi-language videos, multiple audio commentary tracks, or any video with multiple audio streams.
+
+## ⚠️ Platform Compatibility Warning
+
+**This addon has currently only been tested on Linux systems.** While it may work on Windows and macOS, we cannot guarantee compatibility or provide support for these platforms at this time. Use on non-Linux systems at your own risk.
+
+## ✨ Features
+
+- **🎬 Complete Video Import**: Imports the video file along with ALL audio tracks
+- **📦 Clean Organization**: All tracks are packaged into a single metastrip to keep your timeline clean  
+- **🔄 Auto-Setup**: Automatically downloads required FFmpeg static binaries (no system dependencies!)
+- **🌍 Multi-Language Support**: Properly handles language tags and track identification
+- **⚡ One-Click Import**: Simple workflow - select video, click import, done!
+- **🛡️ Steam Runtime Compatible**: Works even when Blender is launched through Steam
+
+## 🚀 Installation
+
+### Method 1: Direct Download
+1. Download the `multi_audio_importer.py` file from this repository
+2. Open Blender and go to `Edit > Preferences > Add-ons`
+3. Click `Install...` and select the downloaded `.py` file
+4. Enable the addon by checking the box next to "Multi-Audio Track Video Importer"
+
+### Method 2: Git Clone
+```bash
+git clone https://github.com/yourusername/multi_audio_importer.git
+cd multi_audio_importer
+# Then install multi_audio_importer.py through Blender as above
+```
+
+## 📋 Requirements
+
+- **Blender 3.0 or higher**
+- **Internet connection** (for initial FFmpeg binary download)
+- **Linux operating system** (other platforms untested)
+- **~80MB free disk space** (for FFmpeg static binaries)
+
+## 🎯 Usage
+
+### First Time Setup
+1. After installing the addon, open the **Video Sequence Editor** workspace in Blender
+2. In the sidebar (press `N` if not visible), look for the **"Multi-Audio"** tab
+3. The addon will automatically download FFmpeg binaries on first use (~40MB download)
+
+### Importing Videos
+1. **Open Video Sequence Editor**: Switch to the Video Editing workspace
+2. **Locate the Addon Panel**: Find "Multi-Audio Import" in the sidebar (N-panel)
+3. **Select Video File**: Click the folder icon next to "Video File" and choose your video
+4. **Import**: Click "Import Video & All Audio (Meta)" 
+5. **Done!** Your video and all audio tracks are now in a metastrip on your timeline
+
+### Working with Metastrips
+- **Enter Metastrip**: Double-click the metastrip to edit individual tracks
+- **Exit Metastrip**: Press `Tab` or click the back arrow
+- **Organize Tracks**: Inside the metastrip, each audio track is on its own channel
+- **Track Names**: Audio tracks are labeled with language/track information when available
+
+## 🎨 Example Workflow
+
+```
+1. Video file: "movie.mkv" (contains video + English + Spanish + Commentary audio)
+   ↓
+2. Import with addon
+   ↓  
+3. Result: Single metastrip "Meta_movie" containing:
+   - Channel 1: Video track
+   - Channel 2: Audio_eng_movie  
+   - Channel 3: Audio_spa_movie
+   - Channel 4: Audio_Track_3_movie (commentary)
+```
+
+## ⚙️ Addon Preferences
+
+Access via `Edit > Preferences > Add-ons > Multi-Audio Track Video Importer`:
+
+- **✅ Binary Status**: Shows if FFmpeg binaries are installed
+- **🔄 Re-download**: Manually re-download FFmpeg binaries if needed
+- **📍 Location**: Shows where binaries are stored
+
+## 🛠️ Troubleshooting
+
+### "FFmpeg binaries not found"
+- **Solution**: Go to addon preferences and click "Download FFmpeg Static Binaries"
+- **Cause**: Usually happens if initial auto-download failed
+
+### "Failed to scan audio tracks"
+- **Check**: Ensure your video file actually contains audio tracks
+- **Try**: Re-download FFmpeg binaries in addon preferences
+- **Verify**: File path is correct and file isn't corrupted
+
+### Import button disabled/greyed out
+- **Solution**: This issue has been resolved in v2.0 - the button should always be enabled
+- **If persists**: Restart Blender and re-enable the addon
+
+### Video imports but no audio
+- **Check**: Your video file may not have multiple audio tracks
+- **Verify**: Try the file in a media player that shows track information (like VLC)
+
+## 🔧 Technical Details
+
+### How It Works
+1. Uses `ffprobe` to scan video files for audio track information
+2. Extracts each audio track to temporary WAV files using `ffmpeg`  
+3. Imports video and audio files as separate strips in Blender's VSE
+4. Groups all strips into a single metastrip for organization
+5. Names tracks based on language tags or track indices
+
+### FFmpeg Integration
+- Downloads static FFmpeg binaries automatically (no system installation required)
+- Binaries are stored in the addon directory
+- Uses industry-standard FFmpeg for maximum compatibility
+- Supports virtually all video formats that contain multiple audio tracks
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to:
+- Report bugs via GitHub issues
+- Submit feature requests  
+- Test on different platforms (especially Windows/macOS)
+- Improve documentation
+- Submit pull requests
+
+## 📝 License
+
+This project is licensed under the GPL-3.0 License - see the LICENSE file for details.
+
+## 🙏 Credits
+
+- **Original Concept**: Parham Ettehadieh
+- **Development**: Jagard11 & Claude AI  
+- **FFmpeg**: The FFmpeg team for their incredible multimedia framework
+- **Static Builds**: John Van Sickle for providing reliable FFmpeg static builds
+
+## 📚 Additional Resources
+
+- [Blender VSE Documentation](https://docs.blender.org/manual/en/latest/video_editing/index.html)
+- [FFmpeg Documentation](https://ffmpeg.org/documentation.html)
+- [Video Tutorial](https://youtu.be/ZeXZrap67jk) (Original addon demonstration)
+
+---
+
+**⭐ If this addon helps your workflow, please consider giving it a star on GitHub!**
