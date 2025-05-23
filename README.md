@@ -9,10 +9,10 @@ A powerful Blender addon that automatically imports video files with **all their
 
 ## 📸 See It In Action
 
-![Multi-Audio Importer in Blender](screenshots/blender-multi-audio-demo.png)
+![Multi-Audio Importer in Blender](screenshots/InitialImport.png)
 *The addon in action: Video and audio tracks organized in a clean metastrip with the simple import interface*
 
-![Inside the Metastrip](screenshots/blender-metastrip-inside.png)
+![Inside the Metastrip](screenshots/InsideMetastrip.png)
 *Inside the metastrip: Each audio track is perfectly organized on its own channel for easy editing and mixing*
 
 ## ⚠️ Platform Compatibility Warning
