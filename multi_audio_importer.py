@@ -285,10 +285,15 @@ class AUDIO_OT_ScanAndImportAll(Operator):
                 
                 self.report({'INFO'}, f"Extracting audio track {stream_index} ({stream_lang})...")
                 try:
+                    # First extract audio with exact timing to match video duration
                     ffmpeg_command = [
                         ffmpeg_exe, "-y", "-i", video_path,
                         "-map", f"0:{stream_index}", 
-                        "-vn", "-acodec", "pcm_s16le",
+                        "-vn",  # No video output
+                        "-acodec", "pcm_s16le",  # Standard WAV codec
+                        "-ar", "48000",  # Standard sample rate
+                        "-ac", "2",  # Stereo output
+                        "-avoid_negative_ts", "make_zero",  # Ensure timing starts at zero
                         temp_path
                     ]
                     
@@ -305,6 +310,12 @@ class AUDIO_OT_ScanAndImportAll(Operator):
                         channel=meta_part_channel,
                         frame_start=frame_start_val
                     )
+                    
+                    # Sync audio strip duration to match video strip duration
+                    if video_strip:
+                        audio_strip.frame_final_end = video_strip.frame_final_end
+                        audio_strip.frame_final_start = video_strip.frame_final_start
+                    
                     strips_for_meta.append(audio_strip)
                     meta_part_channel += 1
                     successfully_imported_audio_count += 1
