@@ -7,6 +7,10 @@
 
 A powerful Blender addon that automatically imports video files with **all their audio tracks** into organized metastrips in the Video Sequence Editor (VSE). Perfect for working with multi-language videos, multiple audio commentary tracks, or any video with multiple audio streams.
 
+## 🎯 Recent Major Update (v2.0)
+
+**✅ Fixed Audio Track Truncation**: The addon now correctly extracts the full natural length of all audio tracks, eliminating the "abrupt ending" issue that occurred with simultaneously recorded tracks. All audio tracks are now imported with their complete duration, preserving perfect sync with video content.
+
 ## 📸 See It In Action
 
 ![Multi-Audio Importer in Blender](screenshots/InitialImport.png)
@@ -70,6 +74,12 @@ cd multi_audio_importer
 - **Organize Tracks**: Inside the metastrip, each audio track is on its own channel
 - **Track Names**: Audio tracks are labeled with language/track information when available
 
+### Audio Synchronization
+- **Perfect Sync**: All audio tracks maintain exact synchronization with video
+- **Simultaneous Recording Support**: Correctly handles tracks recorded at the same time
+- **No Duration Loss**: Preserves complete audio content without truncation
+- **Native Format Preservation**: Uses audio copy mode to avoid timing corruption
+
 ## 🎨 Example Workflow
 
 ```
@@ -103,6 +113,11 @@ Access via `Edit > Preferences > Add-ons > Multi-Audio Track Video Importer`:
 - **Try**: Re-download FFmpeg binaries in addon preferences
 - **Verify**: File path is correct and file isn't corrupted
 
+### Audio tracks cut off/truncated (FIXED in v2.0)
+- **Previous Issue**: Audio tracks would end abruptly around 16-17 minutes
+- **Resolution**: Now extracts full natural track duration without forced time limits
+- **Result**: Perfect sync for simultaneously recorded tracks
+
 ### Import button disabled/greyed out
 - **Solution**: This issue has been resolved in v2.0 - the button should always be enabled
 - **If persists**: Restart Blender and re-enable the addon
@@ -115,15 +130,18 @@ Access via `Edit > Preferences > Add-ons > Multi-Audio Track Video Importer`:
 
 ### How It Works
 1. Uses `ffprobe` to scan video files for audio track information
-2. Extracts each audio track to temporary WAV files using `ffmpeg`  
-3. Imports video and audio files as separate strips in Blender's VSE
-4. Groups all strips into a single metastrip for organization
-5. Names tracks based on language tags or track indices
+2. Extracts each audio track in its native format using `ffmpeg` with `-acodec copy` (no re-encoding)
+3. Preserves the full natural duration of each track without forced truncation
+4. Imports video and audio files as separate strips in Blender's VSE
+5. Groups all strips into a single metastrip for organization
+6. Names tracks based on language tags or track indices
 
 ### FFmpeg Integration
 - Downloads static FFmpeg binaries automatically (no system installation required)
 - Binaries are stored in the addon directory
 - Uses industry-standard FFmpeg for maximum compatibility
+- **Smart Extraction**: Copies audio streams without re-encoding to preserve timing accuracy
+- **Full Duration Preservation**: Extracts complete track lengths for perfect video sync
 - Supports virtually all video formats that contain multiple audio tracks
 
 ## 🤝 Contributing
