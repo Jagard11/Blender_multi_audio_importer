@@ -2,6 +2,8 @@
 
 **Easily import all audio tracks from multi-track video files into Blender's Video Sequence Editor (VSE).**
 
+NOTE: This has only been tested on Linux, and may not work on other operating systems.
+
 Multi-Audio Importer is a powerful Blender addon that automatically detects, extracts, and imports all audio tracks from video files (such as multi-language movies, commentaries, or recordings with multiple microphones) directly into Blender's Video Sequence Editor as organized metastrips.
 
 ![Multi-Audio Import Example](screenshots/Extracted.png)
@@ -186,7 +188,8 @@ This project is licensed under the GNU General Public License v3.0 - see the LIC
 
 ## 👏 Credits
 
-- **Author**: Jagard11 & Claude AI
+- **Original Repo** https://github.com/MacArthurZZZ/multi_audio_importer
+- **Modified By**: Jagard11 & multiple AI models via the Cursor IDE
 - **FFmpeg**: Uses the excellent FFmpeg project for audio processing
 - **Community**: Thanks to the Blender community for feedback and testing
 
