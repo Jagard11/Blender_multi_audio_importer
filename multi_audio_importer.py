@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "Multi-Audio Track Video Importer",
+    "name": "Multi-Audio Track Video Importer & Exporter",
     "author": "Jagard11 & Claude AI",
-    "version": (2, 0),
-    "blender": (3, 0, 0),
+    "version": (3, 0, 1),
+    "blender": (5, 0, 1),
     "location": "Video Sequence Editor > Sidebar > Multi-Audio",
-    "description": "Import video with all its audio tracks into a metastrip using FFmpeg. Auto-downloads static binaries.",
+    "description": "Import & export video with multiple audio tracks using FFmpeg. Import creates metastrips, export creates MKV files with multiple audio tracks. Auto-downloads static binaries.",
     "category": "Sequencer",
     "warning": "Steam installs of Blender may not work with this addon due to the way steam segregates blender from the rest of the system. Manually installing static versions of ffmpeg and ffprobe into the addon directory is recommended.",
     "doc_url": "",
@@ -22,6 +22,128 @@ import re
 import time
 from bpy.props import StringProperty, CollectionProperty, BoolProperty, IntProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup, AddonPreferences
+
+def _maio_vse_scene(context):
+    """Return the scene currently displayed by the VSE editor (if available).
+
+    Blender 5.x can run the VSE inside its own scene; `context.scene` may not
+    always match the sequencer space's scene.
+    """
+    space = getattr(context, "space_data", None)
+    space_scene = getattr(space, "scene", None)
+    return space_scene or context.scene
+
+
+def _maio_sequence_editor(scene):
+    """Return the scene's sequence editor if present, else None."""
+    return getattr(scene, "sequence_editor", None)
+
+
+def _maio_seq_editor_strips(seq_editor):
+    """Return an iterable of sequencer strips across Blender API versions."""
+    if not seq_editor:
+        return None
+
+    # Blender historically exposed "sequences" collections; future versions may
+    # prefer "strips". Support both names.
+    for attr in ("sequences_all", "strips_all", "sequences", "strips"):
+        strips = getattr(seq_editor, attr, None)
+        if strips is not None:
+            return strips
+
+    return None
+
+
+def _maio_seq_editor_collection(seq_editor):
+    """Return the writable strip collection for creating new strips."""
+    if not seq_editor:
+        return None
+
+    for attr in ("sequences", "strips"):
+        collection = getattr(seq_editor, attr, None)
+        if collection is not None:
+            return collection
+
+    return None
+
+
+def _maio_seq_editor_new_sound(seq_editor, *, name, filepath, channel, frame_start):
+    """Create a new sound strip across Blender API versions."""
+    collection = _maio_seq_editor_collection(seq_editor)
+    if collection is None:
+        raise AttributeError("SequenceEditor has no sequences/strips collection")
+
+    new_sound = getattr(collection, "new_sound", None)
+    if new_sound is None:
+        raise AttributeError("SequenceEditor collection has no new_sound()")
+
+    return new_sound(
+        name=name,
+        filepath=filepath,
+        channel=channel,
+        frame_start=frame_start,
+    )
+
+
+def _maio_context_selected_strips(context):
+    """Return selected strips in the current sequencer context, if possible."""
+    for attr in ("selected_sequences", "selected_strips"):
+        selected = getattr(context, attr, None)
+        if selected is not None:
+            return list(selected)
+
+    scene = _maio_vse_scene(context)
+    seq_editor = _maio_sequence_editor(scene)
+    strips = _maio_seq_editor_strips(seq_editor) or []
+    return [s for s in strips if getattr(s, "select", False)]
+
+
+def _maio_strip_has_source(strip):
+    """True if this strip has a usable source filepath."""
+    strip_type = getattr(strip, "type", None)
+    if strip_type == 'MOVIE':
+        return bool(getattr(strip, "filepath", ""))
+    if strip_type == 'SOUND':
+        sound = getattr(strip, "sound", None)
+        return bool(sound and getattr(sound, "filepath", ""))
+    return False
+
+
+def _maio_sequencer_temp_override(context, scene):
+    """Context override for bpy.ops.sequencer.* in Blender 5.x VSE.
+
+    In Blender 5.x the sequencer can display/edit a scene different from
+    `context.scene`. Operators must be executed with an override so they act on
+    the VSE scene.
+    """
+    override = {"scene": scene}
+    if getattr(context, "window", None) is not None:
+        override["window"] = context.window
+    if getattr(context, "screen", None) is not None:
+        override["screen"] = context.screen
+    if getattr(context, "area", None) is not None:
+        override["area"] = context.area
+
+    # Panel/operator runs from the sidebar (UI region). Many sequencer ops need
+    # the WINDOW region.
+    region = None
+    area = getattr(context, "area", None)
+    if area is not None:
+        for r in area.regions:
+            if r.type == 'WINDOW':
+                region = r
+                break
+    if region is None:
+        region = getattr(context, "region", None)
+    if region is not None:
+        override["region"] = region
+
+    space_data = getattr(context, "space_data", None)
+    if space_data is not None:
+        override["space_data"] = space_data
+
+    return bpy.context.temp_override(**override)
+
 
 class MultiAudioImporterPreferences(AddonPreferences):
     bl_idname = __name__
@@ -145,8 +267,8 @@ def get_audio_tracks(video_path):
         return {"error": "ffprobe_not_found", "detail": str(e)}
     
     command = [
-        ffprobe_exe, "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index,duration,codec_name,channels,sample_rate:stream_tags=language",
+        ffprobe_exe, "-v", "error",
+        "-show_entries", "stream=index,codec_type,duration,codec_name,channels,sample_rate:stream_tags=language,title",
         "-of", "json", video_path
     ]
 
@@ -166,7 +288,10 @@ def get_audio_tracks(video_path):
             return {"error": "ffprobe_empty_output", "detail": error_detail}
 
         data = json.loads(result.stdout)
-        return data.get("streams", [])
+        streams = data.get("streams", []) or []
+        audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+        audio_streams.sort(key=lambda s: s.get("index", 0))
+        return audio_streams
 
     except json.JSONDecodeError as e:
         error_detail = f"Error parsing ffprobe output: {e}"
@@ -247,6 +372,683 @@ class AudioTrackItem(PropertyGroup):
     language: StringProperty(name="Language")
     selected: BoolProperty(name="Import", default=False)
 
+# NEW: Property group for export track selection
+class ExportAudioTrackItem(PropertyGroup):
+    index: StringProperty(name="Stream Index")
+    name: StringProperty(name="Track Name", default="Audio Track")
+    language: StringProperty(name="Language", default="")
+    channels: IntProperty(name="Channels", default=2)
+    codec: StringProperty(name="Codec", default="")
+    include: BoolProperty(name="Include in Export", default=True)
+
+# NEW: Multi-track export UI panel
+class SEQUENCER_PT_MultiAudioExport(Panel):
+    bl_label = "Multi-Audio Export"
+    bl_space_type = 'SEQUENCE_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = 'Multi-Audio'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        scene = _maio_vse_scene(context)
+        props = scene.multi_audio_export_props
+        
+        # Check if we're in the sequence editor
+        seq_editor = _maio_sequence_editor(scene)
+        if not seq_editor:
+            layout.label(text="No sequence editor available", icon='INFO')
+            return
+        
+        all_strips = _maio_seq_editor_strips(seq_editor)
+        if all_strips is None:
+            layout.label(text="No sequences available", icon='INFO')
+            return
+        
+        # Check for selected audio/video strips
+        selected_strips = []
+        for strip in _maio_context_selected_strips(context):
+            if strip.type not in {'MOVIE', 'SOUND', 'META'}:
+                continue
+            if strip.type == 'META' or _maio_strip_has_source(strip):
+                selected_strips.append(strip)
+        
+        if not selected_strips:
+            layout.label(text="Select an audio, video strip, or", icon='INFO')
+            layout.label(text="imported metastrip to export")
+            return
+        elif len(selected_strips) > 1:
+            layout.label(text="Select only one strip", icon='ERROR')
+            return
+        
+        selected_strip = selected_strips[0]
+        
+        # Get source file info and display appropriate info
+        if selected_strip.type == 'META':
+            if selected_strip.name.startswith("MultiAudio_"):
+                strip_type = "Imported Metastrip"
+                layout.label(text=f"Selected: {selected_strip.name}", icon='SEQUENCE')
+                layout.label(text=f"Type: {strip_type}", icon='GROUP')
+                source_file = None  # Will be determined inside metastrip
+            else:
+                layout.label(text="⚠ Unsupported metastrip type", icon='ERROR')
+                layout.label(text="Only imported metastrips are supported")
+                return
+        elif selected_strip.type == 'MOVIE':
+            source_file = bpy.path.abspath(selected_strip.filepath)
+            strip_type = "Video"
+            layout.label(text=f"Selected: {selected_strip.name}", icon='SEQUENCE')
+            layout.label(text=f"Type: {strip_type}")
+            
+            if not os.path.isfile(source_file):
+                layout.label(text="⚠ Source file not found", icon='ERROR')
+                return
+        else:  # SOUND
+            source_file = bpy.path.abspath(selected_strip.sound.filepath) if selected_strip.sound else ""
+            strip_type = "Audio"
+            layout.label(text=f"Selected: {selected_strip.name}", icon='SEQUENCE')
+            layout.label(text=f"Type: {strip_type}")
+            
+            if not os.path.isfile(source_file):
+                layout.label(text="⚠ Source file not found", icon='ERROR')
+                return
+        
+        # Analyze button for this specific strip
+        if selected_strip.type == 'META':
+            layout.operator("multi_audio.analyze_strip", icon="VIEWZOOM", text="Analyze Imported Tracks")
+        else:
+            layout.operator("multi_audio.analyze_strip", icon="VIEWZOOM", text="Analyze Audio Tracks")
+        
+        if len(props.export_tracks) == 0:
+            if selected_strip.type == 'META':
+                layout.label(text="Click 'Analyze Imported Tracks' to scan", icon='INFO')
+                layout.label(text="tracks that were imported")
+            else:
+                layout.label(text="Click 'Analyze Audio Tracks' to scan", icon='INFO')
+                layout.label(text="for tracks in this strip")
+            return
+        
+        layout.separator()
+        
+        # Export settings
+        col = layout.column(align=True)
+        col.label(text="Export Settings:", icon='SETTINGS')
+        col.prop(props, "output_path")
+        col.prop(props, "output_filename")
+        
+        row = col.row(align=True)
+        # Only show video codec if we have video
+        if selected_strip.type in ['MOVIE', 'META']:
+            row.prop(props, "video_codec", text="Video")
+        row.prop(props, "audio_codec", text="Audio")
+        
+        layout.separator()
+        
+        # Audio track selection with better organization
+        enabled_tracks = [t for t in props.export_tracks if t.include]
+        unused_tracks = [t for t in props.export_tracks if not t.include]
+        
+        if enabled_tracks:
+            layout.label(text=f"Enabled Tracks ({len(enabled_tracks)}):", icon='CHECKMARK')
+            
+            for track in enabled_tracks:
+                box = layout.box()
+                row = box.row()
+                row.prop(track, "include", text="")
+                
+                col = row.column()
+                col.prop(track, "name", text="")
+                
+                col = row.column()
+                col.enabled = False
+                col.label(text=f"{track.channels}ch")
+                col.label(text=track.codec)
+                
+                if track.language:
+                    row = box.row()
+                    row.enabled = False
+                    row.scale_y = 0.7
+                    row.label(text=f"Language: {track.language}", icon='WORLD')
+        
+        if unused_tracks:
+            layout.separator()
+            unused_box = layout.box()
+            unused_box.label(text=f"Unused Tracks ({len(unused_tracks)}):", icon='X')
+            
+            for track in unused_tracks:
+                row = unused_box.row()
+                row.scale_y = 0.8
+                row.prop(track, "include", text="")
+                
+                col = row.column()
+                if track.name == "[unused]":
+                    col.enabled = False
+                    if track.language:
+                        col.label(text=f"Track {track.index} ({track.language})")
+                    else:
+                        col.label(text=f"Track {track.index}")
+                else:
+                    col.prop(track, "name", text="")
+                
+                col = row.column()
+                col.enabled = False
+                col.label(text=f"{track.channels}ch")
+        
+        layout.separator()
+        
+        # Export button
+        selected_count = sum(1 for track in props.export_tracks if track.include)
+        if selected_count == 0:
+            layout.label(text="Select at least one audio track", icon='ERROR')
+        else:
+            if selected_strip.type in ['MOVIE', 'META']:
+                export_text = f"Export Video + {selected_count} Audio Track"
+            else:
+                export_text = f"Export {selected_count} Audio Track"
+            if selected_count > 1:
+                export_text += "s"
+            layout.operator("multi_audio.export_multitrack", icon="EXPORT", text=export_text)
+
+# NEW: Analyze single strip operator  
+class AUDIO_OT_AnalyzeStrip(Operator):
+    bl_idname = "multi_audio.analyze_strip"
+    bl_label = "Analyze Audio Tracks"
+    bl_description = "Analyze the selected strip for individual audio tracks"
+
+    def execute(self, context):
+        scene = _maio_vse_scene(context)
+        props = scene.multi_audio_export_props
+        props.export_tracks.clear()
+        
+        seq_editor = _maio_sequence_editor(scene)
+        if not seq_editor:
+            self.report({'ERROR'}, "No sequence editor available")
+            return {'CANCELLED'}
+        
+        # Find the selected strip
+        selected_strip = None
+        for strip in _maio_context_selected_strips(context):
+            if strip.type not in {'MOVIE', 'SOUND', 'META'}:
+                continue
+            if strip.type != 'META' and not _maio_strip_has_source(strip):
+                continue
+
+            if selected_strip is None:
+                selected_strip = strip
+            else:
+                self.report({'ERROR'}, "Multiple strips selected. Please select only one.")
+                return {'CANCELLED'}
+        
+        if not selected_strip:
+            self.report({'ERROR'}, "No audio, video, or metastrip selected")
+            return {'CANCELLED'}
+        
+        # Handle imported metastrips (created by import functionality)
+        if selected_strip.type == 'META' and selected_strip.name.startswith("MultiAudio_"):
+            return self._analyze_imported_metastrip(context, selected_strip, props)
+        
+        # Handle regular strips
+        return self._analyze_regular_strip(context, selected_strip, props)
+    
+    def _analyze_imported_metastrip(self, context, meta_strip, props):
+        """Analyze a metastrip created by the import functionality"""
+        self.report({'INFO'}, f"Analyzing imported metastrip: {meta_strip.name}")
+        
+        # Enter the metastrip to analyze its contents
+        scene = _maio_vse_scene(context)
+        seq_editor = _maio_sequence_editor(scene)
+        if not seq_editor:
+            self.report({'ERROR'}, "No sequence editor available")
+            return {'CANCELLED'}
+
+        original_active = seq_editor.active_strip
+        seq_editor.active_strip = meta_strip
+        try:
+            with _maio_sequencer_temp_override(context, scene):
+                bpy.ops.sequencer.meta_toggle()
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to enter metastrip: {e}")
+            return {'CANCELLED'}
+        
+        try:
+            seq_editor = _maio_sequence_editor(scene)
+            
+            # Find the original video/audio strip and additional audio strips
+            video_strip = None
+            audio_strips = []
+            
+            for strip in (_maio_seq_editor_strips(seq_editor) or []):
+                if strip.type == 'MOVIE':
+                    video_strip = strip
+                elif strip.type == 'SOUND' and strip.name.startswith("Audio_"):
+                    audio_strips.append(strip)
+            
+            if not video_strip:
+                self.report({'ERROR'}, "No video strip found in metastrip")
+                return {'CANCELLED'}
+            
+            # Get the original source file for analysis
+            source_file = bpy.path.abspath(video_strip.filepath)
+            
+            if not os.path.isfile(source_file):
+                self.report({'ERROR'}, f"Source file not found: {source_file}")
+                return {'CANCELLED'}
+            
+            # Analyze all audio tracks in the source file
+            try:
+                audio_streams = get_audio_tracks(source_file)
+                
+                if isinstance(audio_streams, dict) and "error" in audio_streams:
+                    self.report({'ERROR'}, f"Could not analyze file: {audio_streams['detail']}")
+                    return {'CANCELLED'}
+                
+                if not audio_streams:
+                    self.report({'INFO'}, "No audio tracks found in source file")
+                    return {'FINISHED'}
+                
+                # Create export track entries
+                imported_track_names = set()
+                
+                # First add the imported tracks (enabled)
+                for i, stream_info in enumerate(audio_streams):
+                    export_track = props.export_tracks.add()
+                    export_track.index = str(stream_info.get("index", ""))
+                    export_track.channels = stream_info.get("channels", 2)
+                    export_track.codec = stream_info.get("codec_name", "unknown")
+                    
+                    stream_lang_tags = stream_info.get("tags", {})
+                    stream_lang = stream_lang_tags.get("language", "")
+                    export_track.language = stream_lang
+                    
+                    # Check if this track was imported
+                    if i == 0:
+                        # First track (main video track)
+                        export_track.name = "Main Audio"
+                        export_track.include = True
+                        imported_track_names.add("Main Audio")
+                    else:
+                        # Check if there's a corresponding audio strip
+                        found_imported = False
+                        for audio_strip in audio_strips:
+                            # Match by language or track pattern
+                            if stream_lang and stream_lang in audio_strip.name:
+                                export_track.name = stream_lang.capitalize()
+                                export_track.include = True
+                                imported_track_names.add(export_track.name)
+                                found_imported = True
+                                break
+                        
+                        if not found_imported:
+                            # This track wasn't imported
+                            export_track.name = "[unused]"
+                            export_track.include = False
+                
+                total_tracks = len(props.export_tracks)
+                imported_count = len([t for t in props.export_tracks if t.include])
+                
+                self.report({'INFO'}, f"Found {total_tracks} total tracks, {imported_count} were imported")
+                
+                # Set default output filename
+                if not props.output_filename:
+                    base_name = meta_strip.name.replace("MultiAudio_", "")
+                    props.output_filename = f"{base_name}_export.mkv"
+                
+                return {'FINISHED'}
+                
+            except Exception as e:
+                self.report({'ERROR'}, f"Error analyzing metastrip: {e}")
+                return {'CANCELLED'}
+        
+        finally:
+            # Exit the metastrip
+            try:
+                with _maio_sequencer_temp_override(context, scene):
+                    bpy.ops.sequencer.meta_toggle()
+            except Exception:
+                pass
+            if original_active:
+                seq_editor = _maio_sequence_editor(scene)
+                if seq_editor:
+                    seq_editor.active_strip = original_active
+    
+    def _analyze_regular_strip(self, context, selected_strip, props):
+        """Analyze a regular audio/video strip"""
+        # Get source file
+        if selected_strip.type == 'MOVIE':
+            source_file = bpy.path.abspath(selected_strip.filepath)
+        elif selected_strip.type == 'SOUND':
+            source_file = bpy.path.abspath(selected_strip.sound.filepath)
+        else:
+            self.report({'ERROR'}, "Unsupported strip type")
+            return {'CANCELLED'}
+        
+        if not os.path.isfile(source_file):
+            self.report({'ERROR'}, f"Source file not found: {source_file}")
+            return {'CANCELLED'}
+        
+        # Analyze audio tracks in this file
+        try:
+            audio_streams = get_audio_tracks(source_file)
+            
+            if isinstance(audio_streams, dict) and "error" in audio_streams:
+                self.report({'ERROR'}, f"Could not analyze file: {audio_streams['detail']}")
+                return {'CANCELLED'}
+            
+            if not audio_streams:
+                self.report({'INFO'}, "No audio tracks found in this file")
+                return {'FINISHED'}
+            
+            # Add each audio stream as an export option
+            for i, stream_info in enumerate(audio_streams):
+                export_track = props.export_tracks.add()
+                export_track.index = str(stream_info.get("index", ""))
+                export_track.channels = stream_info.get("channels", 2)
+                export_track.codec = stream_info.get("codec_name", "unknown")
+                
+                # Generate track name
+                stream_lang_tags = stream_info.get("tags", {})
+                stream_lang = stream_lang_tags.get("language", "")
+                export_track.language = stream_lang
+                
+                if i == 0:
+                    # First track enabled by default
+                    export_track.name = stream_lang.capitalize() if stream_lang else "Main Audio"
+                    export_track.include = True
+                else:
+                    # Additional tracks disabled by default, marked as unused
+                    export_track.name = "[unused]"
+                    export_track.include = False
+            
+            total_tracks = len(props.export_tracks)
+            self.report({'INFO'}, f"Found {total_tracks} audio track(s) in {selected_strip.name}")
+            self.report({'INFO'}, f"Only first track enabled by default - check others to include them")
+            
+            # Set default output filename if not set
+            if not props.output_filename:
+                base_name = os.path.splitext(selected_strip.name)[0]
+                props.output_filename = f"{base_name}_multitrack.mkv"
+            
+            return {'FINISHED'}
+            
+        except Exception as e:
+            self.report({'ERROR'}, f"Error analyzing strip: {e}")
+            return {'CANCELLED'}
+
+# NEW: Multi-track export operator
+class AUDIO_OT_ExportMultitrack(Operator):
+    bl_idname = "multi_audio.export_multitrack"
+    bl_label = "Export Multi-Track File"
+    bl_description = "Export the selected strip with multiple audio tracks to MKV file"
+
+    def execute(self, context):
+        scene = _maio_vse_scene(context)
+        props = scene.multi_audio_export_props
+        
+        # Validate settings
+        if not props.output_path:
+            self.report({'ERROR'}, "Please set output path")
+            return {'CANCELLED'}
+        
+        if not props.output_filename:
+            self.report({'ERROR'}, "Please set output filename")
+            return {'CANCELLED'}
+        
+        selected_tracks = [track for track in props.export_tracks if track.include]
+        if not selected_tracks:
+            self.report({'ERROR'}, "Please select at least one audio track")
+            return {'CANCELLED'}
+        
+        # Find the selected strip
+        selected_strip = None
+        for strip in _maio_context_selected_strips(context):
+            if strip.type not in {'MOVIE', 'SOUND', 'META'}:
+                continue
+            if strip.type != 'META' and not _maio_strip_has_source(strip):
+                continue
+            selected_strip = strip
+            break
+        
+        if not selected_strip:
+            self.report({'ERROR'}, "No strip selected")
+            return {'CANCELLED'}
+        
+        # Get source information - handle metastrips
+        if selected_strip.type == 'META':
+            if not selected_strip.name.startswith("MultiAudio_"):
+                self.report({'ERROR'}, "Unsupported metastrip type")
+                return {'CANCELLED'}
+            
+            # Get source file from within metastrip
+            source_file, has_video = self._get_metastrip_source(context, selected_strip)
+            if not source_file:
+                self.report({'ERROR'}, "Could not find source file in metastrip")
+                return {'CANCELLED'}
+        else:
+            # Regular strip
+            if selected_strip.type == 'MOVIE':
+                source_file = bpy.path.abspath(selected_strip.filepath)
+                has_video = True
+            else:  # SOUND
+                source_file = bpy.path.abspath(selected_strip.sound.filepath) if selected_strip.sound else ""
+                has_video = False
+        
+        # Initialize progress
+        wm = context.window_manager
+        wm.progress_begin(0, 100)
+        
+        try:
+            return self._perform_export(context, props, selected_tracks, source_file, has_video, wm)
+        except Exception as e:
+            self.report({'ERROR'}, f"Export failed: {e}")
+            return {'CANCELLED'}
+        finally:
+            wm.progress_end()
+    
+    def _get_metastrip_source(self, context, meta_strip):
+        """Get the source file and video status from within a metastrip"""
+        scene = _maio_vse_scene(context)
+        seq_editor = _maio_sequence_editor(scene)
+        if not seq_editor:
+            return None, False
+
+        original_active = seq_editor.active_strip
+        seq_editor.active_strip = meta_strip
+        with _maio_sequencer_temp_override(context, scene):
+            bpy.ops.sequencer.meta_toggle()
+        
+        try:
+            seq_editor = _maio_sequence_editor(scene)
+            
+            # Find the video strip
+            for strip in (_maio_seq_editor_strips(seq_editor) or []):
+                if strip.type == 'MOVIE':
+                    source_file = bpy.path.abspath(strip.filepath)
+                    if os.path.isfile(source_file):
+                        return source_file, True
+            
+            # If no video, look for audio
+            for strip in (_maio_seq_editor_strips(seq_editor) or []):
+                if strip.type == 'SOUND' and getattr(strip, "sound", None):
+                    source_file = bpy.path.abspath(strip.sound.filepath) if strip.sound else ""
+                    if os.path.isfile(source_file):
+                        return source_file, False
+            
+            return None, False
+        
+        finally:
+            # Exit the metastrip
+            try:
+                with _maio_sequencer_temp_override(context, scene):
+                    bpy.ops.sequencer.meta_toggle()
+            except Exception:
+                pass
+            if original_active:
+                seq_editor = _maio_sequence_editor(scene)
+                if seq_editor:
+                    seq_editor.active_strip = original_active
+    
+    def _perform_export(self, context, props, selected_tracks, source_file, has_video, wm):
+        # Phase 1: Prepare temporary directory and get source
+        wm.progress_update(10)
+        self.report({'INFO'}, "Preparing export...")
+        
+        temp_dir = tempfile.mkdtemp(prefix="blender_multitrack_")
+        temp_files = []
+        
+        try:
+            # Get source file
+            if not os.path.isfile(source_file):
+                raise Exception(f"Source file not found: {source_file}")
+            
+            # Phase 2: Extract individual audio tracks
+            wm.progress_update(20)
+            audio_files = []
+            
+            for i, track in enumerate(selected_tracks):
+                track_progress = 20 + (60 * i / len(selected_tracks))
+                wm.progress_update(track_progress)
+                
+                audio_file = os.path.join(temp_dir, f"audio_track_{i}.wav")
+                temp_files.append(audio_file)
+                
+                self.report({'INFO'}, f"Extracting audio track: {track.name}")
+                
+                # Extract specific audio stream using index
+                ffmpeg_exe = get_executable_path("ffmpeg")
+                audio_cmd = [
+                    ffmpeg_exe, "-y", "-i", source_file,
+                    "-map", f"0:{track.index}",
+                    "-acodec", "pcm_s16le", "-ar", "48000",
+                    audio_file
+                ]
+                
+                stdout, stderr = run_ffmpeg_with_progress(audio_cmd, 180, None, f"Audio Track: {track.name}")
+                
+                if stderr:
+                    self.report({'WARNING'}, f"Audio extraction failed for {track.name}: {stderr}")
+                    continue
+                
+                if os.path.exists(audio_file):
+                    audio_files.append((audio_file, track.name))
+                else:
+                    self.report({'WARNING'}, f"Audio file not created for {track.name}")
+            
+            # Phase 3: Combine into final MKV
+            wm.progress_update(85)
+            
+            if not audio_files:
+                raise Exception("No audio tracks were successfully extracted")
+            
+            output_path = bpy.path.abspath(props.output_path)
+            if not os.path.isdir(output_path):
+                os.makedirs(output_path, exist_ok=True)
+            
+            final_output = os.path.join(output_path, props.output_filename)
+            
+            self.report({'INFO'}, f"Creating final MKV with {len(audio_files)} audio tracks...")
+            
+            # Build FFmpeg command for final mux
+            ffmpeg_exe = get_executable_path("ffmpeg")
+            final_cmd = [ffmpeg_exe, "-y"]
+            
+            # Add source as first input (for video if it exists)
+            final_cmd.extend(["-i", source_file])
+            
+            # Add individual audio track files
+            for audio_file, _ in audio_files:
+                final_cmd.extend(["-i", audio_file])
+            
+            # Map streams
+            if has_video:
+                final_cmd.extend(["-map", "0:v"])  # Video from source
+                final_cmd.extend(["-c:v", props.video_codec])
+            
+            # Map each audio track
+            for i in range(len(audio_files)):
+                final_cmd.extend(["-map", f"{i + 1}:a"])  # Audio from extracted files
+            
+            final_cmd.extend(["-c:a", props.audio_codec])
+            
+            # Add metadata for audio track names
+            for i, (_, track_name) in enumerate(audio_files):
+                final_cmd.extend([f"-metadata:s:a:{i}", f"title={track_name}"])
+            
+            final_cmd.append(final_output)
+            
+            # Execute final mux
+            stdout, stderr = run_ffmpeg_with_progress(final_cmd, 600, None, "Final Export")
+            
+            if stderr:
+                raise Exception(f"Final mux failed: {stderr}")
+            
+            wm.progress_update(100)
+            
+            if os.path.exists(final_output):
+                file_size_mb = os.path.getsize(final_output) / (1024 * 1024)
+                self.report({'INFO'}, f"✓ Export successful! File: {final_output} ({file_size_mb:.1f} MB)")
+                if has_video:
+                    self.report({'INFO'}, f"✓ Video + {len(audio_files)} audio tracks exported")
+                else:
+                    self.report({'INFO'}, f"✓ {len(audio_files)} audio tracks exported")
+                return {'FINISHED'}
+            else:
+                raise Exception("Output file was not created")
+        
+        finally:
+            # Cleanup temporary files
+            for temp_file in temp_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except:
+                    pass
+            try:
+                os.rmdir(temp_dir)
+            except:
+                pass
+
+# NEW: Export properties container
+class MultiAudioExportProperties(PropertyGroup):
+    export_tracks: CollectionProperty(type=ExportAudioTrackItem)
+    active_track_index: IntProperty()
+    
+    output_path: StringProperty(
+        name="Output Directory",
+        description="Directory to save the exported file",
+        subtype='DIR_PATH',
+        default=""
+    )
+    
+    output_filename: StringProperty(
+        name="Filename",
+        description="Name for the exported file",
+        default=""
+    )
+    
+    video_codec: bpy.props.EnumProperty(
+        name="Video Codec",
+        description="Video codec for export",
+        items=[
+            ('copy', 'Copy (No Re-encode)', 'Copy video stream without re-encoding'),
+            ('libx264', 'H.264', 'H.264 codec for broad compatibility'),
+            ('libx265', 'H.265', 'H.265 codec for better compression'),
+            ('libvpx-vp9', 'VP9', 'VP9 codec for web use'),
+        ],
+        default='copy'
+    )
+    
+    audio_codec: bpy.props.EnumProperty(
+        name="Audio Codec",
+        description="Audio codec for export",
+        items=[
+            ('aac', 'AAC', 'AAC codec for broad compatibility'),
+            ('mp3', 'MP3', 'MP3 codec for smaller files'),
+            ('pcm_s16le', 'PCM WAV', 'Uncompressed audio for highest quality'),
+            ('flac', 'FLAC', 'Lossless compression'),
+        ],
+        default='aac'
+    )
+
 # UI panel in the Video Sequence Editor
 class SEQUENCER_PT_MultiAudioImport(Panel):
     bl_label = "Multi-Audio Import"
@@ -258,18 +1060,21 @@ class SEQUENCER_PT_MultiAudioImport(Panel):
         layout = self.layout
         
         # Check if we're in the sequence editor and have strips
-        if not context.scene.sequence_editor or not context.scene.sequence_editor.sequences:
+        scene = _maio_vse_scene(context)
+        seq_editor = _maio_sequence_editor(scene)
+        all_strips = _maio_seq_editor_strips(seq_editor) if seq_editor else None
+        if not seq_editor or all_strips is None or len(all_strips) == 0:
             layout.label(text="No sequences available", icon='INFO')
             return
             
         # Check for selected video strips
-        seq_editor = context.scene.sequence_editor
         selected_video_strips = []
         
-        for strip in seq_editor.sequences_all:
-            if strip.select and strip.type in ['MOVIE', 'SOUND']:
-                if strip.type == 'MOVIE' or (strip.type == 'SOUND' and hasattr(strip, 'sound') and strip.sound.filepath):
-                    selected_video_strips.append(strip)
+        for strip in _maio_context_selected_strips(context):
+            if strip.type not in {'MOVIE', 'SOUND'}:
+                continue
+            if _maio_strip_has_source(strip):
+                selected_video_strips.append(strip)
         
         if not selected_video_strips:
             layout.label(text="Select a video/movie strip", icon='INFO')
@@ -284,7 +1089,7 @@ class SEQUENCER_PT_MultiAudioImport(Panel):
                 source_file = bpy.path.abspath(selected_strip.filepath)
                 strip_type = "Video"
             else:  # SOUND
-                source_file = bpy.path.abspath(selected_strip.sound.filepath)
+                source_file = bpy.path.abspath(selected_strip.sound.filepath) if selected_strip.sound else ""
                 strip_type = "Audio"
             
             # Display strip info
@@ -313,22 +1118,21 @@ class AUDIO_OT_ExtractAdditionalTracks(Operator):
 
     def execute(self, context):
         # Check sequence editor
-        if not context.scene.sequence_editor:
+        scene = _maio_vse_scene(context)
+        seq_editor = _maio_sequence_editor(scene)
+        if not seq_editor:
             self.report({'ERROR'}, "No sequence editor available.")
             return {'CANCELLED'}
-            
-        seq_editor = context.scene.sequence_editor
         
         # Find selected video/audio strip
         selected_strip = None
-        for strip in seq_editor.sequences_all:
-            if strip.select and strip.type in ['MOVIE', 'SOUND']:
-                if strip.type == 'MOVIE' or (strip.type == 'SOUND' and hasattr(strip, 'sound') and strip.sound.filepath):
-                    if selected_strip is None:
-                        selected_strip = strip
-                    else:
-                        self.report({'ERROR'}, "Multiple strips selected. Please select only one video/audio strip.")
-                        return {'CANCELLED'}
+        for strip in _maio_context_selected_strips(context):
+            if strip.type in {'MOVIE', 'SOUND'} and _maio_strip_has_source(strip):
+                if selected_strip is None:
+                    selected_strip = strip
+                else:
+                    self.report({'ERROR'}, "Multiple strips selected. Please select only one video/audio strip.")
+                    return {'CANCELLED'}
         
         if not selected_strip:
             self.report({'ERROR'}, "No video or audio strip selected.")
@@ -338,7 +1142,7 @@ class AUDIO_OT_ExtractAdditionalTracks(Operator):
         if selected_strip.type == 'MOVIE':
             source_file = bpy.path.abspath(selected_strip.filepath)
         else:  # SOUND
-            source_file = bpy.path.abspath(selected_strip.sound.filepath)
+            source_file = bpy.path.abspath(selected_strip.sound.filepath) if selected_strip.sound else ""
         
         if not os.path.isfile(source_file):
             self.report({'ERROR'}, f"Source file not found: {source_file}")
@@ -364,7 +1168,18 @@ class AUDIO_OT_ExtractAdditionalTracks(Operator):
                 self.report({'INFO'}, "No audio tracks found in source file.")
                 return {'FINISHED'}
             elif len(found_audio_streams) <= 1:
-                self.report({'INFO'}, f"Only {len(found_audio_streams)} audio track found. No additional tracks to extract.")
+                self.report({'INFO'}, f"Only {len(found_audio_streams)} audio stream found in this file. No additional tracks to extract.")
+                if found_audio_streams:
+                    s = found_audio_streams[0]
+                    tags = s.get("tags", {}) or {}
+                    lang = tags.get("language", "")
+                    title = tags.get("title", "")
+                    details = f"index={s.get('index')}, codec={s.get('codec_name')}, channels={s.get('channels')}"
+                    if lang or title:
+                        details += f", lang={lang}, title={title}"
+                    self.report({'INFO'}, f"Detected stream: {details}")
+                self.report({'INFO'}, "Note: This addon extracts additional *audio streams* (tracks). It does not split a single multi-channel stream into multiple tracks.")
+                self.report({'INFO'}, "If you expected more tracks, verify the source file actually contains multiple audio streams (e.g. with ffprobe).")
                 return {'FINISHED'}
             else:
                 self.report({'INFO'}, f"Found {len(found_audio_streams)} audio tracks. Extracting additional tracks...")
@@ -474,7 +1289,7 @@ class AUDIO_OT_ExtractAdditionalTracks(Operator):
                 self.report({'INFO'}, f"Using temporary extraction area starting at frame {temp_extraction_start}")
                 
                 # Find available channels for extraction  
-                occupied_channels = [s.channel for s in seq_editor.sequences_all]
+                occupied_channels = [s.channel for s in (_maio_seq_editor_strips(seq_editor) or [])]
                 if occupied_channels:
                     max_channel = max(occupied_channels)
                     extraction_start_channel = max_channel + 1
@@ -582,7 +1397,8 @@ class AUDIO_OT_ExtractAdditionalTracks(Operator):
                         audio_strip_name = f"Audio_{stream_lang}"
                         
                         # Create the sound strip in safe extraction area  
-                        audio_strip = seq_editor.sequences.new_sound(
+                        audio_strip = _maio_seq_editor_new_sound(
+                            seq_editor,
                             name=audio_strip_name,
                             filepath=temp_path,
                             channel=next_channel,
@@ -616,17 +1432,52 @@ class AUDIO_OT_ExtractAdditionalTracks(Operator):
                     
                     self.report({'INFO'}, f"Temporarily moved original strip to temporary area for grouping...")
                     
+                    # Capture existing strips so we can reliably detect the newly-created metastrip.
+                    before_ptrs = set()
+                    for s in (_maio_seq_editor_strips(seq_editor) or []):
+                        try:
+                            before_ptrs.add(s.as_pointer())
+                        except Exception:
+                            pass
+                    
                     # Select all strips to include in metastrip (original + all new audio tracks)
-                    bpy.ops.sequencer.select_all(action='DESELECT')
+                    with _maio_sequencer_temp_override(context, scene):
+                        bpy.ops.sequencer.select_all(action='DESELECT')
                     selected_strip.select = True
                     for audio_strip in created_audio_strips:
                         audio_strip.select = True
+                    seq_editor.active_strip = selected_strip
                     
                     # Create metastrip from all selected strips
-                    bpy.ops.sequencer.meta_make()
+                    meta_strip = None
+                    try:
+                        with _maio_sequencer_temp_override(context, scene):
+                            bpy.ops.sequencer.meta_make()
+                    except Exception as e:
+                        self.report({'ERROR'}, f"Failed to create metastrip: {e}")
+                    else:
+                        # Prefer a newly-created META strip; fall back to selected/active meta.
+                        after_strips = list(_maio_seq_editor_strips(seq_editor) or [])
+                        new_strips = []
+                        for s in after_strips:
+                            try:
+                                if s.as_pointer() not in before_ptrs:
+                                    new_strips.append(s)
+                            except Exception:
+                                continue
+                        
+                        new_meta = [s for s in new_strips if getattr(s, "type", None) == 'META']
+                        if new_meta:
+                            meta_strip = new_meta[0]
+                        else:
+                            selected_meta = [s for s in after_strips if getattr(s, "type", None) == 'META' and getattr(s, "select", False)]
+                            if selected_meta:
+                                meta_strip = selected_meta[0]
+                            elif getattr(seq_editor, "active_strip", None) and seq_editor.active_strip.type == 'META':
+                                meta_strip = seq_editor.active_strip
                     
-                    if seq_editor.active_strip and seq_editor.active_strip.type == 'META':
-                        meta_strip = seq_editor.active_strip
+                    if meta_strip and meta_strip.type == 'META':
+                        seq_editor.active_strip = meta_strip
                         meta_strip.name = f"MultiAudio_{original_strip_name}"
                         
                         # Phase 6: Restore original position and properties
@@ -665,6 +1516,17 @@ class AUDIO_OT_ExtractAdditionalTracks(Operator):
                         self.report({'INFO'}, f"✓ Using efficient PCM compression (much smaller files)!")
                     else:
                         self.report({'WARNING'}, "Metastrip creation may have failed, but audio tracks were added successfully")
+                        # Restore strip placement so the user can see the extracted audio strips.
+                        try:
+                            selected_strip.frame_start = original_frame_start
+                            selected_strip.channel = original_strip_channel
+                        except Exception:
+                            pass
+                        for audio_strip in created_audio_strips:
+                            try:
+                                audio_strip.frame_start = original_frame_start
+                            except Exception:
+                                pass
                 else:
                     self.report({'WARNING'}, "No additional audio tracks were successfully extracted")
                 
@@ -697,20 +1559,27 @@ classes = (
     MultiAudioImporterPreferences,
     AUDIO_OT_DownloadFFmpeg,
     AudioTrackItem,
+    ExportAudioTrackItem,
     SEQUENCER_PT_MultiAudioImport,
     AUDIO_OT_ExtractAdditionalTracks,
     MultiAudioProperties,
+    SEQUENCER_PT_MultiAudioExport,
+    AUDIO_OT_AnalyzeStrip,
+    AUDIO_OT_ExportMultitrack,
+    MultiAudioExportProperties,
 )
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.multi_audio_props = bpy.props.PointerProperty(type=MultiAudioProperties)
+    bpy.types.Scene.multi_audio_export_props = bpy.props.PointerProperty(type=MultiAudioExportProperties)
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.multi_audio_props
+    del bpy.types.Scene.multi_audio_export_props
 
 if __name__ == "__main__":
     register()
