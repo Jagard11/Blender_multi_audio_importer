@@ -1,10 +1,10 @@
-# 🎧 Multi-Audio Importer — Blender Add-on
+# 🎧 Multi-Audio Importer & Exporter — Blender Add-on
 
-**Easily import all audio tracks from multi-track video files into Blender's Video Sequence Editor (VSE).**
+**Easily import and export all audio tracks from multi-track video files in Blender's Video Sequence Editor (VSE).**
 
-NOTE: This has only been tested on Linux, and may not work on other operating systems.
+NOTE: This has only been tested on Linux. Windows/macOS may work but are currently untested.
 
-Multi-Audio Importer is a powerful Blender addon that automatically detects, extracts, and imports all audio tracks from video files (such as multi-language movies, commentaries, or recordings with multiple microphones) directly into Blender's Video Sequence Editor as organized metastrips.
+Multi-Audio Importer is a powerful Blender addon that automatically detects, extracts, and imports all audio tracks from video files (such as multi-language movies, commentaries, or recordings with multiple microphones) directly into Blender's Video Sequence Editor as organized metastrips, and can export MKV files with multiple audio tracks.
 
 ![Multi-Audio Import Example](screenshots/Extracted.png)
 
@@ -19,13 +19,14 @@ Multi-Audio Importer is a powerful Blender addon that automatically detects, ext
 - **🛡️ Timeline Safety**: Preserves existing timeline content and original strip properties
 - **📊 Progress Tracking**: Real-time progress updates with detailed logging
 - **🎬 Format Support**: Works with `.mkv`, `.mp4`, `.mov`, `.avi`, and other container formats
-- **🔧 Cross-Platform**: Supports Windows, macOS, and Linux
+- **📤 Multi-Track Export**: Export selected VSE strips to an `.mkv` with multiple audio tracks
+- **🔧 OS Support**: Tested on Linux (Windows/macOS untested)
 
 ---
 
 ## 🛠 Requirements
 
-- **Blender** 3.0+ (tested up to 4.x)
+- **Blender** 5.0.1+ (tested on 5.0.1)
 - **Internet connection** (for automatic FFmpeg download on first use)
 
 > **Note**: The addon automatically downloads static FFmpeg binaries on first use, so manual FFmpeg installation is optional but can be done for better performance.
